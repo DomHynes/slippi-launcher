@@ -49,6 +49,9 @@ const getSimpleMachine = () => {
   return machine;
 };
 
+// utility for simple waiting for next event loop, for waiting for listeners to fire
+const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+
 describe("StateMachine", () => {
   let machine = getSimpleMachine();
 
@@ -84,7 +87,44 @@ describe("StateMachine", () => {
     machine.send("attemptConnection");
 
     expect(await receivedUpdate).toBe("CONNECTING");
+  });
 
+  it("can remove observer", async () => {
+    const mockListener = jest.fn();
+
+    const close = machine.observe(mockListener);
+
+    machine.send("attemptConnection");
+    await flush();
+
+    expect(mockListener).toHaveBeenCalledWith("CONNECTING");
+    expect(mockListener).toHaveBeenCalledTimes(1);
+
+    mockListener.mockClear();
+    close();
+
+    machine.send("connectionSuccess");
+
+    //flush several times to make extra sure the listener has not been fired
+    await flush();
+    await flush();
+    await flush();
+
+    expect(mockListener).not.toHaveBeenCalled();
+  });
+
+  it("can clear observers", async () => {
+    const mockListener = jest.fn();
+
+    machine.observe(mockListener);
     machine.close();
+
+    machine.send("attemptConnection");
+
+    await flush();
+    await flush();
+    await flush();
+
+    expect(mockListener).not.toHaveBeenCalled();
   });
 });
