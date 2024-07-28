@@ -233,13 +233,11 @@ class Broadcast extends EventEmitter {
       const broadcast = await this.startBroadcast();
 
       Preconditions.checkExists(broadcast.broadcastId, "Must have broadcast ID");
-      console.log({ broadcast });
       this.state.send({
         type: "BROADCAST_STARTED",
         broadcastId: broadcast.broadcastId,
       });
     } catch (e) {
-      console.log(e);
       const error = e as unknown as Error;
       // TODO: delineate network level error from application level error if possible
       this.state.send({ type: "CONNECTION_ERROR", error });
@@ -278,7 +276,6 @@ class Broadcast extends EventEmitter {
     const broadcast = await futureStartBroadcastResponse;
     //handle recoveryGameCursor
     //handle existing broadcastId - reconnect logic
-    console.log("leaving startbroadcast", { broadcast });
     return broadcast;
   }
 
