@@ -17,6 +17,12 @@ export type StartBroadcastConfig = {
   name?: string;
 };
 
+export type NewStartBroadcastConfig = {
+  viewerId: string;
+  authToken: string;
+  name?: string;
+};
+
 export enum BroadcastEvent {
   SLIPPI_STATUS_CHANGE = "SLIPPI_STATUS_CHANGE",
   DOLPHIN_STATUS_CHANGE = "DOLPHIN_STATUS_CHANGE",
