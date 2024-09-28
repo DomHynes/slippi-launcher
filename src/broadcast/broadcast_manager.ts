@@ -173,6 +173,8 @@ export class BroadcastManager extends EventEmitter {
     });
 
     this.wsClient.on("connect", (connection: connection) => {
+      this.emit("connected");
+
       this.connectingSubState.step = ConnectingSubStep.GET;
       this.connectingSubState.timeout = CONNECTING_SUB_STEP_INITIAL_TIMEOUT;
 

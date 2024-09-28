@@ -15,9 +15,11 @@ export type StartBroadcastConfig = {
   viewerId: string;
   authToken: string;
   name?: string;
+  mode?: "dolphin" | "console";
 };
 
 export type NewStartBroadcastConfig = {
+  mode?: "dolphin" | "console";
   viewerId: string;
   authToken: string;
   name?: string;
@@ -41,12 +43,12 @@ export enum SpectateEvent {
 
 type TypeMap<M extends { [index: string]: any }> = {
   [Key in keyof M]: M[Key] extends undefined
-    ? {
-        type: Key;
-      }
-    : {
-        type: Key;
-      } & M[Key];
+  ? {
+    type: Key;
+  }
+  : {
+    type: Key;
+  } & M[Key];
 };
 
 type SlippiPlayload = {

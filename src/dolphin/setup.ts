@@ -3,8 +3,8 @@ import log from "electron-log";
 import * as fs from "fs-extra";
 import isEqual from "lodash/isEqual";
 import path from "path";
-import { fileExists } from "utils/file_exists";
 
+import { fileExists } from "../utils/file_exists";
 import {
   ipc_checkDesktopAppDolphin,
   ipc_checkPlayKeyExists,

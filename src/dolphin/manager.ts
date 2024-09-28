@@ -6,8 +6,8 @@ import { move, remove } from "fs-extra";
 import { Observable, Subject } from "observable-fns";
 import os from "os";
 import path from "path";
-import { fileExists } from "utils/file_exists";
 
+import { fileExists } from "../utils/file_exists";
 import { type DolphinVersionResponse, fetchLatestVersion } from "./install/fetch_latest_version";
 import { IshiirukaDolphinInstallation } from "./install/ishiiruka_installation";
 import { MainlineDolphinInstallation } from "./install/mainline_installation";

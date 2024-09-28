@@ -1,7 +1,19 @@
-import type { NewStartBroadcastConfig, SlippiBroadcastPayloadEvent } from "@broadcast/types";
-import type { Connection } from "@slippi/slippi-js";
-import { ConnectionEvent } from "@slippi/slippi-js";
-import EventEmitter from "events";
+import { type NewStartBroadcastConfig, type SlippiBroadcastPayloadEvent, BroadcastEvent } from "@broadcast/types";
+import type { Connection, SlpRawEventPayload } from "@slippi/slippi-js";
+import {
+  Command,
+  ConnectionEvent,
+  ConnectionStatus,
+  ConsoleConnection,
+  DolphinConnection,
+  DolphinMessageType,
+  SlpParser,
+  SlpStream,
+  SlpStreamEvent,
+  SlpStreamMode,
+} from "@slippi/slippi-js";
+import EventEmitter, { once } from "events";
+import { createWriteStream } from "fs";
 import Queue from "p-queue";
 import retry from "p-retry";
 import type { connection as WebSocketConnection, Message } from "websocket";
@@ -30,7 +42,11 @@ const waitForWSMessage = <T extends SlippiWSMessage>(connection: WebSocketConnec
   });
 };
 
-const getSlippiWSConnection = (url: string, authToken: string, extraHeaders?: { [key: string]: string }) => {
+const getSlippiWSConnection = async (
+  url: string,
+  authToken: string,
+  extraHeaders?: { [key: string]: string },
+): Promise<WebSocketConnection> => {
   const client = new WebSocketClient({ disableNagleAlgorithm: true });
 
   const headers = {
@@ -39,16 +55,16 @@ const getSlippiWSConnection = (url: string, authToken: string, extraHeaders?: { 
     ...extraHeaders,
   };
 
-  return new Promise<WebSocketConnection>((resolve, reject) => {
-    client.once("connect", (newConnection: WebSocketConnection) => {
-      client.off("connectFailed", reject);
-      resolve(newConnection);
-    });
+  // race connection success with failure for a promise that either resolve with a connection
+  // or rejects with a connection error
+  const [futureConnection] = await Promise.race<[WebSocketConnection]>([
+    once(client, "connect"),
+    new Promise<any>((_resolve, reject) => client.once("connectFailed", reject)),
+  ]);
 
-    client.once("connectFailed", reject);
+  client.connect(url, "broadcast-protocol", undefined, headers);
 
-    client.connect(url, "broadcast-protocol", undefined, headers);
-  });
+  return futureConnection;
 };
 
 // TODO: type this
@@ -56,13 +72,13 @@ type RemoteBroadcast = any;
 
 type SlippiWSCommand =
   | {
-      type: "get-broadcasts";
-    }
+    type: "get-broadcasts";
+  }
   | {
-      type: "start-broadcast";
-      name: string;
-      broadcastId: string | null;
-    };
+    type: "start-broadcast";
+    name: string;
+    broadcastId: string | null;
+  };
 
 type SlippiGetBroadcastsResponse = {
   type: "get-broadcasts-resp";
@@ -176,7 +192,7 @@ class Broadcast extends EventEmitter {
   private wsConnection?: WebSocketConnection;
   private config: Required<NewStartBroadcastConfig>;
 
-  private sendEventQueue = new Queue({ concurrency: 1 });
+  private sendEventQueue = new Queue({ concurrency: 5 });
 
   constructor(private slippiConnection: Connection, private slippiWsURL: string, config: NewStartBroadcastConfig) {
     Preconditions.checkExists(slippiWsURL, "slippiWsURL must be provided");
@@ -188,7 +204,9 @@ class Broadcast extends EventEmitter {
     };
 
     this.state.subscribe(({ value, context }) => {
-      console.log("new state", { value, context });
+      // console.log("new state", { value, context });
+      this.emit(BroadcastEvent.LOG, `new state: ${JSON.stringify({ value, context })}`);
+
       switch (value) {
         case "CONNECTING": {
           void this.initaliseWS();
@@ -206,7 +224,7 @@ class Broadcast extends EventEmitter {
           break;
         }
         case "ERROR": {
-          this.emit("error", context.error);
+          this.emit(BroadcastEvent.ERROR, context.error);
           this.cleanup();
           break;
         }
@@ -321,25 +339,148 @@ class Broadcast extends EventEmitter {
     );
   }
 
+  /**
+   * setUpConnectionListeners
+   *
+   * sets up the logic we need to handle incoming events from console and dolphin connections
+   * the console connection needs a lot of extra work to collect events and massage them into
+   * what the websocket broadcast api expects
+   * @param broadcastId {string}
+   */
   private setUpConnectionListeners(broadcastId: string) {
-    //TODO: type out slippi event emitters
-    this.slippiConnection.on(ConnectionEvent.MESSAGE, (event: SlippiBroadcastPayloadEvent) => {
-      switch (event.type) {
-        case "start_game":
-        case "game_event":
-        case "end_game":
-          if (event.type === "game_event" && !event.payload) {
-            // Don't send empty payload game_event
-            break;
-          }
+    let nextCursor: number | null = null;
+
+    if (this.config.mode === "console") {
+      const slippiStream = new SlpStream({
+        mode: SlpStreamMode.MANUAL,
+      });
+
+      let ready = false;
+      let cursor = 0;
+      const fsStream = createWriteStream("console_output.txt");
+
+      let payloads: Buffer[] = [];
+
+      slippiStream.on(SlpStreamEvent.RAW, (data: SlpRawEventPayload) => {
+        this.emit(BroadcastEvent.LOG, `new raw: ${JSON.stringify(data)}`);
+
+        // 0x35, 0x36, 0x3c, 0x39, 0x10,
+        // by default we bundle all events in a single game frame to send in one websocket message
+        // all incoming events hit the queue, then if a received message was one of these, we send the queue as one bundle
+        const EVENTS_TO_SEND = [
+          Command.MESSAGE_SIZES,
+          Command.GAME_START,
+          Command.FRAME_BOOKEND,
+          Command.GAME_END,
+          Command.SPLIT_MESSAGE,
+        ];
+
+        const sendEvent = (event: SlippiBroadcastPayloadEvent) => {
+          this.emit(BroadcastEvent.LOG, `new outbound event: ${JSON.stringify(event)}`);
+          fsStream.write(JSON.stringify(event) + "\n");
+
+          this.addIncomingEvent(broadcastId, event);
+        };
+
+        // can't get started until we receive message_sizes - should be first message for a game
+        // once we receive this we're ready to start collecting events + inject a START_GAME event at position 0
+        if (data.command === Command.MESSAGE_SIZES) {
+          ready = true;
+          sendEvent({
+            cursor: cursor,
+            next_cursor: cursor + 1,
+            type: DolphinMessageType.START_GAME,
+          });
+
+          cursor++;
+        }
+
+        const event: SlippiBroadcastPayloadEvent = {
+          cursor: cursor,
+          next_cursor: cursor + 1,
+          type: DolphinMessageType.GAME_EVENT,
+        };
+
+        if (data.command === Command.GAME_END) {
+          event.type = DolphinMessageType.END_GAME;
+        }
+
+        // don't send any events if we haven't received message_sizes yet
+        if (!ready) {
+          return;
+        }
+
+        // queue up whatever event this is to the current list of payloads
+        payloads.push(data.payload);
+
+        // only flush payload list for certain events
+        if (!EVENTS_TO_SEND.includes(data.command)) {
+          return;
+        }
+
+        event.payload = Buffer.concat(payloads).toString("base64");
+
+        payloads = [];
+
+        cursor++;
+
+        sendEvent(event);
+      });
+
+      this.slippiConnection.on(ConnectionEvent.DATA, (event) => {
+        this.emit(BroadcastEvent.LOG, `new DATA: ${JSON.stringify(event)}`);
+        slippiStream.write(Buffer.from(event));
+      });
+    }
+
+    if (this.config.mode === "dolphin") {
+      const fsStream = createWriteStream("dolphin_output.txt");
+
+      //TODO: type out slippi event emitters
+      this.slippiConnection.on(ConnectionEvent.MESSAGE, (event: SlippiBroadcastPayloadEvent) => {
+        this.emit(BroadcastEvent.LOG, `new message: ${JSON.stringify(event)}`);
+
+        switch (event.type) {
+          case "start_game":
+          case "game_event":
+          case "end_game":
+            if (event.type === "game_event" && !event.payload) {
+              // Don't send empty payload game_event
+              break;
+            }
+
+            if (event.nextCursor) {
+              nextCursor = event.nextCursor;
+            }
+
+            fsStream.write(JSON.stringify(event) + "\n");
+
+            this.addIncomingEvent(broadcastId, event);
+        }
+      });
+    }
+
+    // if console/dolphin disconnects, send END_GAME to boot any spectating clients back to waiting
+    this.slippiConnection.on(ConnectionEvent.STATUS_CHANGE, (status: number) => {
+      // this should probably also wrap up the broadcast once all events are flushed
+      if (status === ConnectionStatus.DISCONNECTED) {
+        this.addIncomingEvent(broadcastId, {
+          type: DolphinMessageType.END_GAME,
+          cursor: nextCursor,
+          nextCursor: nextCursor,
+          payload: "",
+        });
       }
-      this.addIncomingEvent(broadcastId, event);
     });
   }
 
   private async setupSlippiWS() {
     this.wsConnection = await getSlippiWSConnection(this.slippiWsURL, this.config.authToken, {
       target: this.config.viewerId,
+    });
+
+    this.wsConnection.on("error", (error) => {
+      this.state.send({ type: "CONNECTION_ERROR", error });
     });
   }
 

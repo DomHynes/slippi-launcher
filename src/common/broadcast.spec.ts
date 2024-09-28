@@ -1,201 +1,342 @@
-import type { StartBroadcastConfig } from "@broadcast/types";
-import { type Connection, ConnectionEvent } from "@slippi/slippi-js";
-import EventEmitter from "events";
+/* eslint-disable jest/expect-expect */
+import "./test/wsMocks";
+
+process.env.SLIPPI_WS_SERVER = "ws://test-server";
+import { BroadcastManager } from "@broadcast/broadcast_manager";
+import { type StartBroadcastConfig, BroadcastEvent } from "@broadcast/types";
+import type { SlpRawEventPayload } from "@slippi/slippi-js";
+import {
+  type Connection,
+  ConnectionEvent,
+  ConsoleCommunication,
+  DolphinConnection,
+  DolphinMessageType,
+  Ports,
+  SlpParser,
+  SlpParserEvent,
+  SlpStream,
+  SlpStreamEvent,
+  SlpStreamMode,
+} from "@slippi/slippi-js";
+import { open } from "fs/promises";
+import path from "path";
 import { client as WSClient, connection as WSConnection } from "websocket";
 
-import type { SlippiWSMessage } from "./broadcast";
 import { Broadcast } from "./broadcast";
+import {
+  flush,
+  initializeBroadcast,
+  initializeConnections,
+  mockSendEvent,
+  mockStartGame,
+  waitForEvent,
+} from "./test/utils";
 
-jest.mock("websocket", () => {
-  const mockClient = new EventEmitter();
-  // @ts-expect-error mocking
-  mockClient.connect = jest.fn();
-  // @ts-expect-error mocking
-  mockClient.close = jest.fn();
+const mockConfig = (config: Partial<StartBroadcastConfig> = {}): StartBroadcastConfig => ({
+  ip: "test",
+  port: 123,
+  viewerId: "test",
+  authToken: "test",
+  name: "test-name",
 
-  const mockConnection = new EventEmitter();
-  // @ts-expect-error mocking
-  mockConnection.close = jest.fn();
-  // @ts-expect-error mocking
-  mockConnection.send = jest.fn((_data, cb) => cb && cb());
-
-  return {
-    client: jest.fn().mockImplementation(() => mockClient),
-    connection: jest.fn().mockImplementation(() => mockConnection),
-  };
+  ...config,
 });
 
-const waitForEvent = (emitter: EventEmitter, eventName: string) => {
-  return new Promise((resolve, reject) => {
-    setTimeout(() => {
-      reject(`timed out waiting for event ${eventName}`);
-    }, 5000);
-
-    const handler = (data: any) => {
-      emitter.off(eventName, handler);
-      resolve({ event: eventName, data });
-    };
-
-    emitter.on(eventName, handler);
-  });
-};
-
-const getBroadcast = (
+const _getBroadcast = (
   connection: Connection,
   url: string = "ws://test",
   config: Partial<StartBroadcastConfig> = {},
 ) => {
-  return new Broadcast(connection, url, {
-    ip: "test",
-    port: 123,
-    viewerId: "test",
-    authToken: "test",
-
-    ...config,
-  });
+  return new Broadcast(connection, url, mockConfig(config));
 };
 
-const mockWSMessage = <TMessage extends SlippiWSMessage>(data: TMessage) => {
-  return {
-    type: "utf8",
-    utf8Data: JSON.stringify(data),
-  };
-};
+const broadcastId = "test-broadcast";
 
-const getMockConnection = () => {
-  // @ts-expect-error mocking
-  return new WSConnection();
-};
-
-const getMockSlippiConnection = (): Connection => {
-  const mock = new EventEmitter();
-
-  return mock as unknown as Connection;
-};
-
-const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
-
-describe("Broadcast", () => {
-  let slippiConnection = getMockSlippiConnection();
-
-  let broadcast = getBroadcast(slippiConnection);
-  let wsClient = jest.mocked(new WSClient());
-  let wsConnection = jest.mocked(getMockConnection());
-
-  beforeAll(() => {});
-
-  beforeEach(() => {
-    slippiConnection = getMockSlippiConnection();
-    broadcast = getBroadcast(slippiConnection);
-    wsClient = jest.mocked(new WSClient());
-    wsConnection = jest.mocked(getMockConnection());
-  });
-
-  afterEach(() => {
+const stopBroadcast = (broadcast: BroadcastManager | Broadcast) => {
+  if (broadcast instanceof Broadcast) {
     broadcast.close();
-  });
+    return;
+  }
+  broadcast.stop();
+};
 
-  it("successfully connects", async () => {
-    const futureConnectEvent = waitForEvent(broadcast, "connected");
+describe(`Broadcast`, () => {
+  [
+    {
+      type: "BroadcastManager",
+      getBroadcast: () => new BroadcastManager(),
+      getConnection: (): Connection => new DolphinConnection(),
+    },
+    {
+      type: "New Broadcast",
+      getBroadcast: _getBroadcast,
+      getConnection: (): Connection => new DolphinConnection(),
+      newBroadcast: true,
+    },
+  ].forEach(({ type, getBroadcast, getConnection, newBroadcast }) => {
+    let slippiConnection = getConnection();
+    let broadcast = getBroadcast(slippiConnection, undefined, { mode: "dolphin" });
+    const wsClient = jest.mocked(new WSClient());
+    const wsConnection = jest.mocked(new WSConnection());
 
-    broadcast.start();
+    beforeEach(() => {
+      slippiConnection = getConnection();
+      broadcast = getBroadcast(slippiConnection, undefined, { mode: "dolphin" });
 
-    wsClient.emit("connect", wsConnection);
-
-    expect(await futureConnectEvent).toEqual({
-      event: "connected",
+      wsConnection.send.mockClear();
     });
-  });
 
-  it("handles connection error", async () => {
-    const futureErrorEvent = waitForEvent(broadcast, "error");
-
-    broadcast.start();
-
-    const connectionError = new Error("mock connection error");
-
-    wsClient.emit("connectFailed", new Error("mock connection error"));
-
-    expect(await futureErrorEvent).toEqual({
-      data: connectionError,
-      event: "error",
+    afterEach(async () => {
+      stopBroadcast(broadcast);
+      await flush();
+      await flush();
+      await flush();
     });
-  });
 
-  it("starts broadcast when it receives broadcast response", async () => {
-    const testBroadcastId = "test-broadcast";
-    broadcast.start();
+    if (newBroadcast) {
+      it("will retry if a send fails", async () => {
+        await initializeConnections({
+          broadcast,
+          connection: slippiConnection,
+          wsClient,
+          wsConnection,
+        });
 
-    wsClient.emit("connect", wsConnection);
-    await flush();
+        await initializeBroadcast({
+          wsConnection,
+          broadcastId,
+        });
 
-    // should assert the broadcast class emits the broadcast req
-    wsConnection.emit("message", mockWSMessage({ type: "get-broadcasts-resp", broadcasts: [] }));
-    await flush();
+        wsConnection.send.mockClear();
 
-    wsConnection.emit("message", mockWSMessage({ type: "start-broadcast-resp", broadcastId: testBroadcastId }));
-    await flush();
+        mockStartGame({ connection: slippiConnection });
+        await flush();
 
-    slippiConnection.emit(ConnectionEvent.MESSAGE, { type: "start_game", payload: "dummy" });
-    await flush();
+        const messages = [
+          JSON.stringify({ type: "send-event", broadcastId: "test-broadcast", event: { type: "start_game" } }),
+          mockSendEvent(broadcastId, "1"),
+          mockSendEvent(broadcastId, "2"),
+        ];
 
-    //@ts-expect-error mocking
-    expect(wsConnection.send.mock.lastCall[0]).toBe(
-      JSON.stringify({
-        type: "send-event",
-        broadcastId: testBroadcastId,
-        event: {
-          type: "start_game",
-          payload: "dummy",
-        },
-      }),
-    );
-  });
+        messages.forEach((value, index) => {
+          expect(wsConnection.send.mock.calls[index][0]).toEqual(value);
+        });
 
-  it("will retry if a send fails", async () => {
-    const testBroadcastId = "test-broadcast";
-    broadcast.start();
+        await flush();
+        await flush();
 
-    wsClient.emit("connect", wsConnection);
-    await flush();
+        expect(wsConnection.send).toBeCalledTimes(3);
+        //@ts-expect-error mocking
+        expect(JSON.parse(wsConnection.send.mock.calls[0][0]).event).toEqual({ type: "start_game" });
+        //@ts-expect-error mocking
+        expect(JSON.parse(wsConnection.send.mock.calls[1][0]).event).toEqual({ type: "game_event", payload: "1" });
+        //@ts-expect-error mocking
+        expect(JSON.parse(wsConnection.send.mock.calls[2][0]).event).toEqual({ type: "game_event", payload: "2" });
 
-    // should assert the broadcast class emits the broadcast req
-    wsConnection.emit("message", mockWSMessage({ type: "get-broadcasts-resp", broadcasts: [] }));
-    await flush();
+        wsConnection.send.mockClear();
 
-    wsConnection.emit("message", mockWSMessage({ type: "start-broadcast-resp", broadcastId: testBroadcastId }));
-    await flush();
+        wsConnection.send.mockImplementationOnce((_data, cb) => cb(new Error("Failed to fetch")));
 
-    wsConnection.send.mockClear();
+        slippiConnection.emit(ConnectionEvent.MESSAGE, { type: "game_event", payload: "3" });
+        slippiConnection.emit(ConnectionEvent.MESSAGE, { type: "game_event", payload: "4" });
+        await flush();
+        await flush();
 
-    slippiConnection.emit(ConnectionEvent.MESSAGE, { type: "start_game" });
-    slippiConnection.emit(ConnectionEvent.MESSAGE, { type: "game_event", payload: "1" });
-    slippiConnection.emit(ConnectionEvent.MESSAGE, { type: "game_event", payload: "2" });
-    await flush();
+        expect(wsConnection.send).toBeCalledTimes(3);
+        //@ts-expect-error mocking
+        expect(JSON.parse(wsConnection.send.mock.calls[0][0]).event).toEqual({ type: "game_event", payload: "3" });
+        //@ts-expect-error mocking
+        expect(JSON.parse(wsConnection.send.mock.calls[1][0]).event).toEqual({ type: "game_event", payload: "4" });
+        //@ts-expect-error mocking
+        expect(JSON.parse(wsConnection.send.mock.calls[2][0]).event).toEqual({ type: "game_event", payload: "3" });
+      });
+    }
 
-    expect(wsConnection.send).toBeCalledTimes(3);
-    //@ts-expect-error mocking
-    expect(JSON.parse(wsConnection.send.mock.calls[0][0]).event).toEqual({ type: "start_game" });
-    //@ts-expect-error mocking
-    expect(JSON.parse(wsConnection.send.mock.calls[1][0]).event).toEqual({ type: "game_event", payload: "1" });
-    //@ts-expect-error mocking
-    expect(JSON.parse(wsConnection.send.mock.calls[2][0]).event).toEqual({ type: "game_event", payload: "2" });
+    it("successfully connects", async () => {
+      const futureConnectEvent = waitForEvent(broadcast, "connected");
 
-    wsConnection.send.mockClear();
+      await initializeConnections({
+        broadcast,
+        connection: slippiConnection,
+        wsClient,
+        wsConnection,
+      });
 
-    wsConnection.send.mockImplementationOnce((_data, cb) => cb?.(new Error("Failed to fetch")));
+      expect(await futureConnectEvent).toEqual({
+        event: "connected",
+      });
+    });
 
-    slippiConnection.emit(ConnectionEvent.MESSAGE, { type: "game_event", payload: "3" });
-    slippiConnection.emit(ConnectionEvent.MESSAGE, { type: "game_event", payload: "4" });
-    await flush();
-    await flush();
+    it("handles connection error", async () => {
+      const futureErrorEvent = waitForEvent(broadcast, BroadcastEvent.ERROR);
 
-    expect(wsConnection.send).toBeCalledTimes(3);
-    //@ts-expect-error mocking
-    expect(JSON.parse(wsConnection.send.mock.calls[0][0]).event).toEqual({ type: "game_event", payload: "3" });
-    //@ts-expect-error mocking
-    expect(JSON.parse(wsConnection.send.mock.calls[1][0]).event).toEqual({ type: "game_event", payload: "3" });
-    //@ts-expect-error mocking
-    expect(JSON.parse(wsConnection.send.mock.calls[2][0]).event).toEqual({ type: "game_event", payload: "4" });
+      await initializeConnections({
+        broadcast,
+        connection: slippiConnection,
+        wsClient,
+        wsConnection,
+      });
+
+      await initializeBroadcast({
+        wsConnection,
+        broadcastId,
+      });
+
+      const connectionError = new Error("mock connection error");
+
+      wsConnection.emit("error", connectionError);
+
+      expect(await futureErrorEvent).toEqual({
+        data: connectionError,
+        event: BroadcastEvent.ERROR,
+      });
+    });
+
+    it("starts broadcast when it receives broadcast response", async () => {
+      await initializeConnections({
+        broadcast,
+        connection: slippiConnection,
+        wsClient,
+        wsConnection,
+      });
+
+      await initializeBroadcast({
+        wsConnection,
+        broadcastId,
+      });
+      await flush();
+
+      slippiConnection.emit(ConnectionEvent.MESSAGE, { type: "start_game", payload: "dummy" });
+      await flush();
+
+      //@ts-expect-error mocking
+      expect(wsConnection.send.mock.lastCall[0]).toBe(
+        JSON.stringify({
+          type: "send-event",
+          broadcastId,
+          event: {
+            type: "start_game",
+            payload: "dummy",
+          },
+        }),
+      );
+    });
+
+    it("e2e - dolphin", async () => {
+      wsConnection.send.mockClear();
+
+      await initializeConnections({
+        broadcast,
+        connection: slippiConnection,
+        wsClient,
+        wsConnection,
+      });
+
+      await initializeBroadcast({
+        wsConnection,
+        broadcastId,
+      });
+      await flush();
+
+      expect(wsConnection.send.mock.calls[0][0]).toEqual(JSON.stringify({ type: "get-broadcasts" }));
+      expect(wsConnection.send.mock.calls[1][0]).toEqual(
+        JSON.stringify({ type: "start-broadcast", name: "test-name", broadcastId: null }),
+      );
+      await flush();
+
+      wsConnection.send.mockClear();
+      mockStartGame({ connection: slippiConnection });
+      await flush();
+
+      const messages = [
+        JSON.stringify({ type: "send-event", broadcastId: "test-broadcast", event: { type: "start_game" } }),
+        mockSendEvent(broadcastId, "1"),
+        mockSendEvent(broadcastId, "2"),
+      ];
+
+      messages.forEach((value, index) => {
+        expect(wsConnection.send.mock.calls[index][0]).toEqual(value);
+      });
+    });
+
+    it.skip("successfully handles slpstream", async () => {
+      const slippiConnection = getConnection();
+
+      const testFile = "./test/test.slp";
+      const slippiStream = new SlpStream({
+        mode: SlpStreamMode.MANUAL,
+      });
+      const parser = new SlpParser();
+      let count = 0;
+
+      slippiStream.on(SlpStreamEvent.COMMAND, (data: SlpRawEventPayload) => {
+        parser.handleCommand(data.command, data.payload);
+        // console.log({ slippiStream: data.payload.toString("base64") });
+
+        count++;
+        if (count == 10) {
+          throw new Error(count);
+        }
+      });
+
+      parser.on(SlpParserEvent.FRAME, (data) => {
+        console.log({ slpParser: data });
+      });
+
+      const file = await open(path.resolve(__dirname, testFile), "r");
+
+      const fileStream = file.createReadStream();
+
+      fileStream.pipe(slippiStream);
+
+      await new Promise((resolve) => setTimeout(resolve, 10000));
+    });
+
+    it.skip("successfully handles dolphinconnection", async () => {
+      const dolphinConnection = new DolphinConnection();
+
+      let count = 0;
+
+      const comms = new ConsoleCommunication();
+
+      dolphinConnection.on(ConnectionEvent.ERROR, (error) => {
+        console.log({ error });
+      });
+
+      dolphinConnection.on(ConnectionEvent.STATUS_CHANGE, (status: number) => {
+        console.log(`Dolphin status change: ${status}`);
+        console.log(status);
+      });
+
+      dolphinConnection.on(ConnectionEvent.DATA, (data) => {
+        comms.receive(data);
+
+        const messages = comms.getMessages();
+
+        console.log(messages[0]);
+        console.log(messages);
+
+        if (!data.payload) {
+          return;
+        }
+
+        if (
+          data.type !== DolphinMessageType.GAME_EVENT &&
+          data.type !== DolphinMessageType.START_GAME &&
+          data.type !== DolphinMessageType.END_GAME
+        ) {
+          return;
+        }
+
+        count++;
+        if (count == 10) {
+          throw new Error(String(count));
+        }
+      });
+
+      await dolphinConnection.connect("127.0.0.1", Ports.DEFAULT);
+
+      await new Promise((resolve) => setTimeout(resolve, 1200000));
+    });
   });
 });
