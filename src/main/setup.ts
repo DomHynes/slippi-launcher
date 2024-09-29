@@ -6,7 +6,6 @@ import { app, clipboard, dialog, ipcMain, nativeImage, shell } from "electron";
 import electronLog from "electron-log";
 import type { ProgressInfo, UpdateInfo } from "electron-updater";
 import { autoUpdater } from "electron-updater";
-import * as fs from "fs-extra";
 import path from "path";
 import { fileExists } from "utils/file_exists";
 
@@ -18,7 +17,6 @@ import {
   ipc_checkValidIso,
   ipc_clearTempFolder,
   ipc_copyLogsToClipboard,
-  ipc_deleteDesktopAppPath,
   ipc_deleteFiles,
   ipc_fetchNewsFeed,
   ipc_getLatestGitHubReleaseVersion,
@@ -31,7 +29,7 @@ import {
 } from "./ipc";
 import { getNetworkDiagnostics } from "./network_diagnostics";
 import { fetchNewsFeedData } from "./news_feed";
-import { getAssetPath, readLastLines } from "./util";
+import { clearTempFolder, getAssetPath, readLastLines } from "./util";
 import { verifyIso } from "./verify_iso";
 
 const log = electronLog.scope("main/listeners");
@@ -88,14 +86,6 @@ export default function setupMainIpc({
     } catch (err) {
       return { path, valid: IsoValidity.INVALID };
     }
-  });
-
-  ipc_deleteDesktopAppPath.main!.handle(async () => {
-    // get the path and remove
-    const desktopAppPath = path.join(app.getPath("appData"), "Slippi Desktop App");
-    await fs.remove(desktopAppPath);
-
-    return { success: true };
   });
 
   ipc_copyLogsToClipboard.main!.handle(async () => {
@@ -172,10 +162,8 @@ export default function setupMainIpc({
   });
 
   ipc_clearTempFolder.main!.handle(async () => {
-    const tmpDir = path.join(app.getPath("userData"), "temp");
     try {
-      await fs.remove(tmpDir);
-      await fs.ensureDir(tmpDir);
+      await clearTempFolder();
     } catch (err) {
       log.error(err);
       throw err;
